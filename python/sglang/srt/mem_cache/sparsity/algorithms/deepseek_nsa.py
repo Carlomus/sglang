@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Any, Optional
 
 import torch
@@ -5,6 +6,8 @@ import torch
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithmImpl,
 )
+
+from klogger import IndexLogConfig, TopKLogger
 
 
 class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
@@ -17,6 +20,10 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
 
     def __init__(self, config, device: torch.device, **kwargs):
         super().__init__(config, device, **kwargs)
+
+        # Default logger config, no overrides.
+        self._topk_log_cfg = IndexLogConfig()
+        self._topk_logger = TopKLogger(self._topk_log_cfg)
 
     def retrieve_topk(
         self,
@@ -38,16 +45,33 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
         if any(v is None for v in [indexer, x, q_lora, positions, forward_batch]):
             raise ValueError("Required: indexer, forward_batch, x, q_lora, positions")
 
-        return (
-            indexer(
-                x=x,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=layer_id,
-            ),
-            None,
+        topk = indexer(
+            x=x,
+            q_lora=q_lora,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
         )
+
+        run_id = 0
+
+        # If topk is None -> enqueue a sentinel tensor of -2s
+        if topk is None:
+            device = queries.device if torch.is_tensor(queries) else "cuda"
+            topk_to_log = torch.full((1, 1), -2, dtype=torch.int32, device=device)
+            self._topk_logger.enqueue(
+                topk_to_log, run_id=run_id, layer_id=layer_id, start_pos=0
+            )
+            return (topk, None)
+
+        try:
+            if torch.is_tensor(topk) and topk.numel() > 0 and (topk == -1).all().item():
+                return (topk, None)
+        except Exception:
+            pass
+
+        self._topk_logger.enqueue(topk, run_id=run_id, layer_id=layer_id, start_pos=0)
+        return (topk, None)
 
     def initialize_representation_pool(
         self,
